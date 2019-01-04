@@ -1,0 +1,135 @@
+#!/usr/bin/env groovy
+
+pipeline {
+  agent {
+    label 'docker-oracle'
+  }
+
+   environment {
+        ARTIFACT = 'mpd-api-bundle.tar.gz'
+        RELEASE_JOB = 'release-job-uat' 
+        NODE_ENV = 'uat'
+    }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+
+        script {
+          scmVars = checkout scm
+
+            configFileProvider([configFile(fileId: 'c2da8bf2-01f2-4c01-bb24-604452208fc6', variable: 'config')]) {
+                        script{
+                            serverConfig = sh (
+                                            script: "cat ${env.config}",
+                                            returnStdout: true
+                                            ).trim()
+                            InputJSON = new groovy.json.JsonSlurperClassic().parseText(serverConfig)
+                            host= "${InputJSON.test.user}@${InputJSON.test.mpd_api}"
+                            }
+                            }
+
+          script {
+            // set current build name
+            currentBuild.displayName = "#${env.BUILD_NUMBER} - ${scmVars.GIT_LOCAL_BRANCH}"
+
+            // notify bitbucket server about build
+            this.notifyStash('INPROGRESS')
+          }
+        }
+      }
+    }
+   stage('Install') {
+      steps {
+        // notify bitbucket server about build
+        script {
+          this.notifyStash('INPROGRESS')
+        }
+
+        // install dependencies
+        sh 'npm install'
+      }
+    }
+    
+   stage('Build') {
+      steps {
+          // build archive with server
+              sh "mkdir output && tar --exclude './output' --exclude './.git' --exclude './node_modules' -czf output/${ARTIFACT} ./"
+              sh "du -hs output/*"              
+              // make archive available in Jenkins
+              archiveArtifacts artifacts: "output/${ARTIFACT}", fingerprint: false
+          }
+      }
+    stage('Lint') {
+        steps {
+            echo 'No Linting specified'
+            checkstyle canComputeNew: false, defaultEncoding: '', healthy: '', pattern: 'reports/eslint.xml', unHealthy: ''
+        }
+    }
+     stage('Test') {
+        steps {
+            echo 'No Testing specified'
+        }
+    } 
+         stage('Deploy') {
+            steps {
+                sshagent (credentials: ['digital-transformation-ssh']) {
+                        sh "ssh -o StrictHostKeyChecking=no ${host} 'rm -rf mpd_api_temp && mkdir -p mpd_api_temp && mkdir -p mpd_api_test'"
+                        sh "scp -o StrictHostKeyChecking=no -r output/* ${host}:~/mpd_api_temp/"
+                        sh "ssh -o StrictHostKeyChecking=no ${host} 'cd mpd_api_temp/; tar -xvf ${ARTIFACT}'"
+                        sh "ssh -o StrictHostKeyChecking=no ${host}  'cd mpd_api_temp/ ; npm install'"
+                        sh "ssh -o StrictHostKeyChecking=no ${host} 'pm2 stop MPD-api-Cluster ; rm -rf mpd_api_test/* '"
+                        sh "ssh -o StrictHostKeyChecking=no ${host} 'mv mpd_api_temp/* mpd_api_test'"
+                        sh "ssh -o StrictHostKeyChecking=no ${host} 'cd mpd_api_test && NODE_ENV=${NODE_ENV} pm2 start MPD-api-Cluster.js --name MPD-api-Cluster'"
+                }
+            }
+        }   
+    stage('Release'){
+      steps {
+        release job: "${RELEASE_JOB}", parameters: [string(name: 'releaseVersion', value: "${env.TAG}"), string(name: 'GIT_URL', value: "${env.GIT_URL}")]
+      }
+    }
+  }
+
+  post {
+    failure {
+      // send email to the person who broke the build
+      emailext(body: '${DEFAULT_CONTENT}', mimeType: 'text/html',
+        replyTo: '$DEFAULT_REPLYTO', subject: '${DEFAULT_SUBJECT}',
+        to: emailextrecipients([[$class: 'CulpritsRecipientProvider']]))
+
+    }
+    unstable {
+      // send email to the person who broke the build
+      emailext(body: '${DEFAULT_CONTENT}', mimeType: 'text/html',
+        replyTo: '$DEFAULT_REPLYTO', subject: '${DEFAULT_SUBJECT}',
+        to: emailextrecipients([[$class: 'CulpritsRecipientProvider']]))
+
+    }
+    always {
+      script {
+        // notify bitbucket server about build
+        // null result is success
+        this.notifyStash(currentBuild.result ?: 'SUCCESS')
+      }
+    }
+  }
+}
+
+def notifyStash(String state) {
+
+  if ('SUCCESS' == state || 'FAILED' == state) {
+    currentBuild.result = state
+  }
+
+  step([$class                       : 'StashNotifier',
+        credentialsId                : 'ecommerce-service-account',
+        disableInprogressNotification: false,
+        considerUnstableAsSuccess    : true,
+        ignoreUnverifiedSSLPeer      : true,
+        includeBuildNumberInKey      : false,
+        prependParentProjectKey      : false,
+        stashServerBaseUrl           : 'https://bitbucket.mot-solutions.com'])
+
+}

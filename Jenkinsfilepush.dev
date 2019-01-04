@@ -1,0 +1,216 @@
+#!/usr/bin/env groovy
+
+pipeline {
+
+    agent {
+        label 'docker-oracle'
+    }
+    
+    environment {
+        ARTIFACT = 'localization-user-registration.tar.gz'
+        REVISION = 'revision'
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                // fetch shared configuration that is used across different jobs
+                configFileProvider([configFile(fileId: 'shared-config', variable: 'SHARED_CONFIG')]) {
+                    script {
+                        rawSharedConfig = sh(script: "cat ${env.SHARED_CONFIG}", returnStdout: true).trim()
+                        SharedConfig = new groovy.json.JsonSlurperClassic().parseText(rawSharedConfig)
+                    }
+                }
+
+                script {
+                    scmVars = checkout scm
+
+                    // set current build name
+                    currentBuild.displayName = "#${env.BUILD_NUMBER} - ${scmVars.GIT_LOCAL_BRANCH}"
+
+                    // notify bitbucket server about build
+                    this.notifyStash('INPROGRESS')
+                }
+            }
+        }
+        
+        stage('Install'){
+            steps{
+                sh 'sudo easy_install pip'
+                sh 'sudo pip install transifex-client'
+                sh 'tx --version'
+            }
+        }
+
+        stage('Tx Config'){
+            steps{
+                sh "tx set --source -r digital-transformation.user-registration-base-en-us-json -l en src/user-registration-base_en_US.json"
+        
+                sh "tx config mapping --execute -r digital-transformation.user-registration-base-en-us-json --source-lang en --type JSON \
+--source-file src/user-registration-base_en_US.json --expression 'translation/<lang>/user-registration-base.json' || echo 'continuing build...'"
+               
+                // Configuring multiple local files (mapping-bulk)
+                // sh "tx config mapping-bulk -p digital-transformation --source-language en --type JSON -f '.json' \ --source-file-dir src --expression 'translation/<lang>/user-registration-base.json'"
+            }
+        }
+
+        stage('Find changes in Src Files'){
+            steps{
+                /*
+                * To Find out new changes on any given commit.
+                */
+                sh "git checkout -b ${REVISION}"
+                //Note "-m 1" is only applicable for `develop` branch as it is for MRs. If you are running this command in oher branches(Normal commit hash) then remove it.
+                sh "git revert --no-edit -m 1 ${scmVars.GIT_COMMIT} || git revert --no-edit ${scmVars.GIT_COMMIT}"
+                sh "git checkout ${scmVars.GIT_COMMIT}"
+
+                script{
+                    //Find out new changes in the commit
+                    //if single resource
+                    gitDiff = "git diff --word-diff=plain ${REVISION} src/user-registration-base_en_US.json"
+                    //if there are multiple resources
+                    //gitDiff = "git diff --word-diff=plain ${REVISION} src"
+
+                    String fileContent = sh(
+                        script: "${gitDiff}",
+                        returnStdout: true
+                    ).trim()
+                    echo "${fileContent}"
+
+                    //Each line into an array
+                    String[] splitData = fileContent.split("\n")
+                    arr = [];
+                    //Iterate the Array to parse the newly introduced line.
+                    for (file in splitData) {
+                        if (file.startsWith("{+")) {
+                            file = file.minus("{+")
+                            file = file.minus("+}")
+                            echo "${file}"
+                            arr.push(file)
+                        }
+                    }
+                }
+                echo "Newly Found strings : ${arr}"
+            }
+
+        }
+
+        stage('Lint'){
+            steps{
+                sh 'sudo npm install jsonlint -g'
+                sh 'jsonlint src/user-registration-base_en_US.json'
+            }
+        }
+
+        stage('Tx Push'){
+            steps{
+                sh 'export TX_TOKEN=1/c64e299f19c620a8faed2cb995d5bbf915f51473 && tx --debug --traceback push -s -b develop'
+                
+                //it takes git repo branch name as transifex branch name
+                //sh 'export TX_TOKEN=1/c64e299f19c620a8faed2cb995d5bbf915f51473 && tx --debug --traceback push -s -b'
+                sh 'tx status'
+            }
+        }
+
+        stage('Sleep'){
+            steps{
+                sleep 100
+            }
+        }
+
+        stage('Tx Pull'){
+            steps{
+                sh 'export TX_TOKEN=1/c64e299f19c620a8faed2cb995d5bbf915f51473 && tx --debug --traceback pull -f --minimum-perc=0 -a --no-interactive -b develop'
+                sh 'tx status'
+
+                //download pseduo translations
+                script{
+                    //sh "curl -i -L --user api:1/c64e299f19c620a8faed2cb995d5bbf915f51473 -X GET https://www.transifex.com/api/2/project/digital-transformation/resource/develop--user-registration-base-en-us-json/pseudo/?pseudo_type=MIXED | sed 's/[\\][n]//g' | sed 's/[\\]//g' >> user-registration-base.json"
+                    sh "curl -i -L --user api:1/c64e299f19c620a8faed2cb995d5bbf915f51473 -X GET https://www.transifex.com/api/2/project/digital-transformation/resource/develop--user-registration-base-en-us-json/pseudo/?pseudo_type=MIXED >> user-registration-base.json"
+
+                    sh "cat user-registration-base.json"
+
+                    sh "cd translation && mkdir -p en_us_pseudo"
+                    sh "mv 'user-registration-base.json' 'translation/en_us_pseudo'"
+
+                    // sh 'cd en_us_pseudo && ls && cat user-registration-base.json'
+                }
+
+
+            }
+        }
+
+        stage('Unit Test'){
+            steps{
+                sh  'echo "Unit test..."'
+            }
+        }
+        
+        stage('Commit Translated Files to BB'){
+            steps{
+                sshagent(credentials: ['digital-transformation-ssh']) {
+                    script{
+                        scmVars = checkout scm
+                        sh "git config --global user.email 'Jenkins@motorolasolutions.com'"
+                        sh "git config --global user.name 'Jenkins'"
+                        sh "git checkout ${scmVars.GIT_LOCAL_BRANCH}"
+                        //sh "git stash"
+                        sh "git pull origin ${scmVars.GIT_LOCAL_BRANCH}"
+                        //sh "git stash pop || echo 'nothing to stash...'"
+                        sh "git status"
+                        sh "git add translation/*"
+                        sh "git status"
+                        sh "git commit -m 'Translation update from Transifex' || echo 'New translation not found. continuing build...'"
+                        sh "git push origin ${scmVars.GIT_LOCAL_BRANCH}"
+                        sh "git status"
+                    }
+                }
+            }
+        }
+        
+        stage('Publish') {
+            steps {
+                sshagent(credentials: ['digital-transformation-ssh']) {
+                    // push new version and tag
+                    sh "git tag ${BUILD_NUMBER}"
+                    sh "git push origin ${scmVars.GIT_LOCAL_BRANCH} && git push --tags origin ${scmVars.GIT_LOCAL_BRANCH}"
+                }
+            }
+        }
+    }
+    
+    post {
+        unstable {
+            // send email to the person who broke the build
+            emailext(body: '${DEFAULT_CONTENT}', mimeType: 'text/html',
+                replyTo: '$DEFAULT_REPLYTO', subject: '${DEFAULT_SUBJECT}',
+                to: emailextrecipients([[$class: 'CulpritsRecipientProvider']]))
+
+        }
+        
+        always {
+            script {
+                // notify bitbucket server about build
+                // null result is success
+                this.notifyStash(currentBuild.result ?: 'SUCCESS')
+            }
+        }
+    }
+}
+
+def notifyStash(String state) {
+
+    if ('SUCCESS' == state || 'FAILED' == state) {
+        currentBuild.result = state
+    }
+
+    step([$class : 'StashNotifier',
+        credentialsId : 'ecommerce-service-account',
+        disableInprogressNotification: false,
+        considerUnstableAsSuccess : true,
+        ignoreUnverifiedSSLPeer : true,
+        includeBuildNumberInKey : false,
+        prependParentProjectKey : false,
+        stashServerBaseUrl : 'https://bitbucket.mot-solutions.com'])
+
+}

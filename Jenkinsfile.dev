@@ -1,0 +1,386 @@
+#!/usr/bin/env groovy
+
+def scmVars
+def arr
+def build_ok = true
+def processed_stages = false
+def backup_filename 
+pipeline {
+    agent {
+        label 'docker-oracle'
+    }
+
+    environment {
+        ARTIFACT = 'C360-bundle.tar.gz'
+        REVISION = 'revision'
+        NODE_ENV = 'dev'
+    }
+
+    stages {
+
+        stage('Checkout') {
+
+            steps {
+
+                script {
+                    scmVars = checkout scm
+
+                    configFileProvider([configFile(fileId: 'c2da8bf2-01f2-4c01-bb24-604452208fc6', variable: 'config')]) {
+                        script{
+                            serverConfig = sh(
+                                script: "cat ${env.config}",
+                                returnStdout: true
+                            ).trim()
+
+                            InputJSON = new groovy.json.JsonSlurperClassic().parseText(serverConfig)
+                            host = "${InputJSON.dev.user}@${InputJSON.dev.c360}"
+                            PGPASSWORD = "${InputJSON.dev.pgpass}"
+                            ENCRYPTION_KEY = "${InputJSON.dev.C360_ENCRYPTION_KEY}"
+                            MULE_ACCESS_TOKEN_URL = "${InputJSON.dev.C360_MULE_ACCESS_TOKEN_URL}"
+                            MULE_ACCESS_TOKEN_CLIENT_ID = "${InputJSON.dev.C360_MULE_ACCESS_TOKEN_CLIENT_ID}"
+                            MULE_ACCESS_TOKEN_CLIENT_SECRET = "${InputJSON.dev.C360_MULE_ACCESS_TOKEN_CLIENT_SECRET}"
+                            C360_DB = "${InputJSON.dev.C360_DB}"
+                            C360_UNAME = "${InputJSON.dev.C360_UNAME}"
+                            C360_DB_PORT = "${InputJSON.dev.C360_DB_PORT}"
+                            G_CAPTCHA_SECRET = "${InputJSON.dev.G_CAPTCHA_SECRET}"
+                        }
+                    }
+                    script {
+                        // set current build name
+                        currentBuild.displayName = "#${env.BUILD_NUMBER} - ${scmVars.GIT_LOCAL_BRANCH}"
+
+                        // notify bitbucket server about build
+                        this.notifyStash('INPROGRESS')
+                    }
+                }
+            }
+
+        }
+        stage('Get Diff'){
+            steps{
+                // sh "echo -e '\nThis is a new line' >> db/Script_Manifest.sh"
+                // sh "echo -e '\npsql -h c360-dev.cwjeswfcgrio.us-east-1.rds.amazonaws.com -p 5432 -U c360 -d c360 -f DB_Script/Db_changes_002.sql' >> db/Script_Manifest.sh"
+                // sh "cat db/Script_Manifest.sh"
+
+                /*
+                * To Find out new changes on any given commit.
+                */
+                sh "git checkout -b ${REVISION}"
+                //Note "-m 1" is only applicable for `develop` branch as it is for MRs. If you are running this command in oher branches(Normal commit hash) then remove it.
+                sh "git revert --no-edit -m 1 ${scmVars.GIT_COMMIT} || git revert --no-edit ${scmVars.GIT_COMMIT}"
+                sh "git checkout ${scmVars.GIT_COMMIT}"
+            }
+
+        }
+        stage('Find Changed Files'){
+            steps{
+                script{
+                    // git diff --diff-filter=AM --name-only origin/develop db/dev-db| xargs
+
+                    //Find out new changes in the commit
+                    gitDiff = "git diff --word-diff=plain revision db/Script_Manifest.sh"
+
+                    //parse the stdout into variable
+                    String fileContent = sh(
+                        script: "${gitDiff}",
+                        returnStdout: true
+                    ).trim()
+                    echo "${fileContent}"
+                    // arr = fileContent.tokenize()
+                    //Each line into an array
+                    String[] splitData = fileContent.split("\n")
+                    arr = [];
+                    //Iterate the Array to parse the newly introduced line.
+                    for (file in splitData) {
+                        if (file.startsWith("{+")) {
+                            file = file.minus("{+")
+                            file = file.minus("+}")
+                            //Interpolate
+                            file = file.replaceAll('\\$\\{C360_DB_URL\\}', C360_DB)
+                                .replaceAll('\\$\\{C360_DB_PORT\\}', C360_DB_PORT)
+                                .replaceAll('\\$\\{C360_UNAME\\}', C360_UNAME)
+                            echo "${file}"
+                            arr.push(file)
+                        }
+                    }
+                    echo "Newly Found commands : ${arr}"
+                    
+                    sshagent(credentials: ['digital-transformation-ssh']) {
+                        if(arr.size() > 0){
+                            sh "ssh -o StrictHostKeyChecking=no ${host} 'echo \"Started Jenkins deployment for C360 DEV, so application will not be available for a while.\" | mail -s \"C360 DEV deployment\" -S smtp=\"remotesmtp.mot-solutions.com\" -r \"Jenkins@Customer360DEV\" \"tbjm36@motorolasolutions.com,fcbv68@motorolasolutions.com,krvp47@motorolasolutions.com,preeti.vanjani@motorolasolutions.com,jdaniel1@motorolasolutions.com,dwmg73@motorolasolutions.com\" '"
+                        }
+                    }
+                }
+            }
+        }
+        stage('HPE Fortify') {
+            steps {
+
+                script {
+                    fortifyUrl = "${InputJSON.dev.fortifyUrl}"
+                    fortifyAuthToken = "${InputJSON.dev.fortifyAuthToken}"
+
+                    // notify bitbucket server about build
+                    this.notifyStash('INPROGRESS')
+                }
+                echo 'Security Scanning using HP Fortify (Code Review)...'
+                sh "fortifyupdate"
+                sh "sourceanalyzer -b ${JOB_NAME} -clean"
+                sh "sourceanalyzer -b ${JOB_NAME} ${WORKSPACE}"
+                sh "sourceanalyzer -b ${JOB_NAME} -scan -f '${WORKSPACE}/Assessment.fpr'"
+                // sh "BIRTReportGenerator -template 'Developer Workbook' -source '${WORKSPACE}/Assessment.fpr' -format 'PDF' -output '${WORKSPACE}/Security_Findings.pdf'"
+                sh "ls -lrt '${WORKSPACE}' "
+                sh "fortifyclient -url ${fortifyUrl} -authtoken ${fortifyAuthToken} uploadFPR -file ${WORKSPACE}/Assessment.fpr -application ${JOB_NAME} -applicationVersion '1'"
+                // archiveArtifacts artifacts: '**/Security_Findings.pdf'
+            }
+
+        }
+        stage("Dependency Check") {
+            steps {
+                dependencyCheckAnalyzer datadir: 'dependency-check-data', hintsFile: '', includeCsvReports: true, includeHtmlReports: true, includeVulnReports: true,
+                    includeJsonReports: false, isAutoupdateDisabled: false, outdir: '', scanpath: '', skipOnScmChange: false, skipOnUpstreamChange: false, suppressionFile:
+                '', zipExtensions: ''
+
+                dependencyCheckPublisher canComputeNew: false, defaultEncoding: '', healthy: '', pattern: '', unHealthy: ''
+
+                archiveArtifacts allowEmptyArchive: true, artifacts: '**/dependency-check-report.xml', onlyIfSuccessful: true
+            }
+
+        }
+        stage('Build') {
+            steps {
+                // build archive with server
+                sh "mkdir output && tar --exclude './output' --exclude './node_modules' -czf output/${ARTIFACT} ./"
+                sh "du -hs output/*"
+
+                // make archive available in Jenkins
+                archiveArtifacts artifacts: "output/${ARTIFACT}", fingerprint: false
+            }
+
+        }
+
+        stage('Take DB Dump') {
+            steps {
+                sshagent(credentials: ['digital-transformation-ssh']) {
+		       sh "ssh -o StrictHostKeyChecking=no ${host} 'cd C360_dev'"
+                    // sh "ssh -o StrictHostKeyChecking=no ${host} 'export PGPASSWORD=${PGPASSWORD} && pg_dump -w -h ${C360_DB} -U ${C360_UNAME} -d c360 -f pg_dump.dump'"
+                    //   sh "ssh -o StrictHostKeyChecking=no ${host} 'pg_dump -w -h c360-dev.cwjeswfcgrio.us-east-1.rds.amazonaws.com -U c360 -d c360 -f pg_dump.dump'"
+                }
+            }
+
+        }
+
+        stage('Deploy') {
+            steps {
+                script {
+                    sshagent(credentials: ['digital-transformation-ssh']) {
+                        sh "ssh -o StrictHostKeyChecking=no ${host} 'rm -rf C360_temp && mkdir -p C360_temp && mkdir -p C360_dev'"
+                        sh "scp -o StrictHostKeyChecking=no -r output/* ${host}:~/C360_temp/"
+                        sh "ssh -o StrictHostKeyChecking=no ${host} 'cd C360_temp/; tar -xvf ${ARTIFACT}'"
+                        sh "ssh -o StrictHostKeyChecking=no ${host}  'cd C360_temp/ ; npm install'"
+                        backup_filename = sh(
+                            script: "echo C360_dev`date --utc '+_%d_%m_%Y_%H-%M'`",
+                            returnStdout: true
+                        ).trim()
+                        sh "ssh -o StrictHostKeyChecking=no ${host} 'mv C360_dev ${backup_filename}; mv C360_temp C360_dev'"
+                        processed_stages =true;
+                        if(arr.size() > 0){
+                            sh "ssh -o StrictHostKeyChecking=no ${host} 'pm2 stop c360_jenkins'"
+                        }
+                        // sh "ssh -o StrictHostKeyChecking=no ${host} 'pm2 stop c360_jenkins; rm -rf C360_dev_bkp_old;mv C360_dev_bkp C360_dev_bkp_old;mv C360_dev C360_dev_bkp; mv C360_temp C360_dev'"
+                        for (command in arr) {
+                            // sh "ssh -o StrictHostKeyChecking=no ${host} 'cd C360_dev && cd db && cd dev-db && export PGPASSWORD=${PGPASSWORD} && psql -w -h c360-dev.cwjeswfcgrio.us-east-1.rds.amazonaws.com -U c360 -d c360 -f ${command}'"
+                            sh "ssh -o StrictHostKeyChecking=no ${host} 'cd C360_dev/db && export PGPASSWORD=${PGPASSWORD} && ${command}'"
+                        }
+                        // sh "ssh -o StrictHostKeyChecking=no ${host} 'cd C360_dev && echo ENCRYPTION_KEY=${ENCRYPTION_KEY} >> .env && echo G_CAPTCHA_SECRET=${G_CAPTCHA_SECRET} >> .env && echo MULE_ACCESS_TOKEN_URL=${MULE_ACCESS_TOKEN_URL} >> .env && echo MULE_ACCESS_TOKEN_CLIENT_ID=${MULE_ACCESS_TOKEN_CLIENT_ID} >> .env && echo MULE_ACCESS_TOKEN_CLIENT_SECRET=${MULE_ACCESS_TOKEN_CLIENT_SECRET} >> .env && echo NOVE_ENV=dev >> .env && npm install && pm2 start c360_jenkins'"
+                        sh "ssh -o StrictHostKeyChecking=no ${host} 'cd C360_dev && echo ENCRYPTION_KEY=${ENCRYPTION_KEY} >> .env && echo NODE_ENV=dev >> .env && echo HTTP_PORT=9597 >> .env && echo HTTPS_PORT=9543 >> .env && echo G_CAPTCHA_SECRET=6LeIxAcTAAAAAGG-vFI1TnRWxMZNFuojJ4WifJWe >> .env && echo MULE_ACCESS_TOKEN_URL=${MULE_ACCESS_TOKEN_URL} >> .env && echo MULE_ACCESS_TOKEN_CLIENT_ID=${MULE_ACCESS_TOKEN_CLIENT_ID} >> .env && echo MULE_ACCESS_TOKEN_CLIENT_SECRET=${MULE_ACCESS_TOKEN_CLIENT_SECRET} >> .env && npm install && pm2 start app.js --name c360_jenkins_testing'"
+                    }
+                }
+            }
+
+        }
+
+        stage('Mandatory Test'){
+            steps{
+                sshagent(credentials: ['digital-transformation-ssh']) {
+                    //sh "ssh -o StrictHostKeyChecking=no ${host} 'cd C360_dev'"
+                    sh "ssh -o StrictHostKeyChecking=no ${host} 'cd C360_dev/ && mocha test/mandatory-test.js'"
+
+                }
+            }
+                }
+
+
+
+        stage('Flow Test') {
+            steps {
+                script{
+                    try {
+
+                        sshagent(credentials: ['digital-transformation-ssh']) {
+                            sh "ssh -o StrictHostKeyChecking=no ${host} 'cd C360_dev/ && mocha --reporter json > ./test/test-results/json/`date \'+%d_%m_%Y\'.json`'"
+                        }
+                        post{
+                            failure {
+                                // send email to the person who broke the build
+                                emailext(body: 'Flow test failed in dev deployment', mimeType: 'text/html',
+                                    replyTo: '$DEFAULT_REPLYTO', subject: '${DEFAULT_SUBJECT}',
+                                    to: emailextrecipients([[$class: 'CulpritsRecipientProvider']]))
+                            }
+                        }
+                    }
+                    catch (Exception e) {
+                        build_ok = false
+                        echo e.toString()
+                    }
+                }
+            }
+
+        }
+        stage('Export Flow Test Results'){
+            steps{
+                script{
+                    sshagent(credentials: ['digital-transformation-ssh']) {
+                        sh "ssh -o StrictHostKeyChecking=no ${host} 'cd C360_dev/ && node exportTestExcel.js `date \'+%d_%m_%Y\'`'"
+                        sh "ssh -o StrictHostKeyChecking=no ${host} 'echo \"Please find the attached test result\" | mail -a \"C360_dev/test/test-results/excel/`date +\'%d_%m_%Y\'.xlsx`\" -s \"Test results from Jenkins DEV deployment\" -S smtp=\"remotesmtp.mot-solutions.com\" -r \"Jenkins@Customer360DEV\" \"tbjm36@motorolasolutions.com,fcbv68@motorolasolutions.com,krvp47@motorolasolutions.com,preeti.vanjani@motorolasolutions.com,jdaniel1@motorolasolutions.com,dwmg73@motorolasolutions.com\" '"
+		    }
+
+                }
+            }
+
+        }
+
+        stage('confirm'){
+            steps {
+                script{
+                    def userInput = true
+                    def didTimeout = false
+                    try {
+                        timeout(time: 900, unit: 'SECONDS') {
+                            // change to a convenient timeout for you
+
+                            emailext(body: """
+                          See ${ env.BUILD_URL }input /
+                                """,
+                              mimeType: 'text/html',
+                                replyTo: '$DEFAULT_REPLYTO',
+                                subject: "Please approve #${env.BUILD_NUMBER}",
+                                to: 'C360DeployUpdate@motorolasolutions.com'
+                                //   attachmentsPattern: "temp/*.xlsx"
+                            )
+
+                            userInput = input(
+                                id: 'Proceed1', message: 'Was this successful?', submitterParameter: 'submitter', submitter: '',
+                                parameters: [
+                                    [$class: 'BooleanParameterDefinition', defaultValue: true, description: '', name: 'Please confirm you agree with this']
+                                ])
+                        }
+                    }
+                    catch (err) {
+                        // timeout reached or input false
+                        def user = err.getCauses()[0].getUser()
+                        if ('SYSTEM' == user.toString()) {
+                            // SYSTEM means timeout.
+                            didTimeout = true
+                        }
+                        else {
+                            userInput = false
+                            echo "Aborted by: [${user}]"
+                        }
+                        currentBuild.result = 'FAILURE'
+                    }
+                }
+            }
+
+        }
+    }
+    post {
+        success {
+            script{                
+                    sshagent(credentials: ['digital-transformation-ssh']) { 
+                        echo "Build success so starting app with actual 8000 port";
+                        sh "ssh -o StrictHostKeyChecking=no ${host} 'cd C360_dev && rm -rf .env'"
+                        sh "ssh -o StrictHostKeyChecking=no ${host} 'pm2 stop c360_jenkins_testing'"
+                        sh "ssh -o StrictHostKeyChecking=no ${host} 'cd C360_dev && echo NODE_ENV=dev >> .env && echo ENCRYPTION_KEY=${ENCRYPTION_KEY} >> .env && echo HTTP_PORT=8000 >> .env && echo HTTPS_PORT=8443 >> .env && echo G_CAPTCHA_SECRET=${G_CAPTCHA_SECRET} >> .env && echo MULE_ACCESS_TOKEN_URL=${MULE_ACCESS_TOKEN_URL} >> .env && echo MULE_ACCESS_TOKEN_CLIENT_ID=${MULE_ACCESS_TOKEN_CLIENT_ID} >> .env && echo MULE_ACCESS_TOKEN_CLIENT_SECRET=${MULE_ACCESS_TOKEN_CLIENT_SECRET} >> .env && npm install && pm2 restart app.js -i 0 --name c360_jenkins'"
+                    }
+            }
+            // send email to the person when the build is success
+            emailext(body: '${DEFAULT_CONTENT}', mimeType: 'text/html',
+                replyTo: '$DEFAULT_REPLYTO', subject: '${DEFAULT_SUBJECT}',
+                to: emailextrecipients([[$class: 'CulpritsRecipientProvider']]),
+                attachLog: false,
+                compressLog: false,
+                attachmentsPattern: "temp/*.xlsx")
+        }
+        failure {
+            script{
+                echo "value of processed_stages : ${processed_stages}"
+                if (processed_stages) {
+                    script {
+                        sshagent(credentials: ['digital-transformation-ssh']) {
+                            sh "ssh -o StrictHostKeyChecking=no ${host} 'pm2 stop c360_jenkins_testing'"
+                            sh "ssh -o StrictHostKeyChecking=no ${host} 'rm -rf C360_dev && cp -irp ${backup_filename} C360_dev && mv ${backup_filename}  ${backup_filename}_restored && pm2 start app.js -i 0 --name c360_jenkins'"
+                            // sh "ssh -o StrictHostKeyChecking=no ${host} 'mv C360_dev_bkp C360_dev && mv C360_dev_bkp_old C360_dev_bkp && pm2 restart c360_jenkins'"
+                        }
+                    }
+                } else {
+                    echo "existing code untouched"
+                }
+            }
+            // send email to the person who broke the build
+            emailext(body: '${DEFAULT_CONTENT}', mimeType: 'text/html',
+                replyTo: '$DEFAULT_REPLYTO', subject: '${DEFAULT_SUBJECT}',
+                to: emailextrecipients([[$class: 'CulpritsRecipientProvider']]))
+
+        }
+        unstable {
+            // send email to the person who broke the build
+            emailext(body: '${DEFAULT_CONTENT}', mimeType: 'text/html',
+                replyTo: '$DEFAULT_REPLYTO', subject: '${DEFAULT_SUBJECT}',
+                to: emailextrecipients([[$class: 'CulpritsRecipientProvider']]))
+
+        }
+        always {
+            script {
+                // notify bitbucket server about build
+                // null result is success
+                this.notifyStash(currentBuild.result ?: 'SUCCESS')
+            }
+        }
+    }
+}
+def notifyStash(String state) {
+
+    if ('SUCCESS' == state || 'FAILED' == state) {
+        currentBuild.result = state
+    }
+
+    step([$class : 'StashNotifier',
+        credentialsId : 'ecommerce-service-account',
+        disableInprogressNotification: false,
+        considerUnstableAsSuccess : true,
+        ignoreUnverifiedSSLPeer : true,
+        includeBuildNumberInKey : false,
+        prependParentProjectKey : false,
+        stashServerBaseUrl : 'https://bitbucket.mot-solutions.com'])
+
+}
+
+
+
+
+
+
+
+
+
+
+
+===============================
+deploy stage
+
+sh "echo 'Uploading...'"
+sh "chmod 755 ./ci/deploy.sh"
+sh "npm run deploy"
+
+

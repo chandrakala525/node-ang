@@ -1,0 +1,139 @@
+#!/usr/bin/env groovy
+
+pipeline {
+    agent {
+        label 'docker-oracle'
+    }
+
+    environment {
+        ENV_NAME = 'test'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                script {
+                    scmVars = checkout scm
+
+                    // set current build name
+                    currentBuild.displayName = "#${env.BUILD_NUMBER} - ${params.tag}"
+
+                    // notify bitbucket server about build
+                    this.notifyStash('INPROGRESS')
+                }
+            }
+        }
+
+        stage('Install'){
+            steps{
+                sh 'sudo easy_install pip'
+                sh 'sudo pip install transifex-client'
+                sh 'tx --version'
+            }
+        }
+        stage('Normalization'){
+            steps{
+                //Tx pull/pull translated files
+                sh 'export TX_TOKEN=1/c64e299f19c620a8faed2cb995d5bbf915f51473 && tx --debug --traceback pull -f --minimum-perc=0 -a --no-interactive -b develop'
+                sh 'tx status'
+
+                script{
+                    //Pseudo Files
+                    //sh "curl -i -L --user api:1/c64e299f19c620a8faed2cb995d5bbf915f51473 -X GET https://www.transifex.com/api/2/project/digital-transformation/resource/develop--user-registration-base-en-us-json/pseudo/?pseudo_type=MIXED | sed 's/[\\][n]//g' | sed 's/[\\]//g' >> user-registration-base.json"
+                    sh "curl -i -L --user api:1/c64e299f19c620a8faed2cb995d5bbf915f51473 -X GET https://www.transifex.com/api/2/project/digital-transformation/resource/develop--user-registration-base-en-us-json/pseudo/?pseudo_type=MIXED >> user-registration-base.json"
+                    sh "cat user-registration-base.json"
+
+                    sh "cd translation && mkdir -p en_us_pseudo"
+                    sh "mv 'user-registration-base.json' 'translation/en_us_pseudo'"
+
+                    // sh 'cd en_us_pseudo && ls && cat user-registration-base.json'
+                }
+
+                //Normalization
+                script{
+
+                    sourceDiff = sh "git diff src/user-registration-base_en_US.json translation/en_us/user-registration-base.json"
+
+                    echo "${sourceDiff}"
+
+                    if ("${sourceDiff}" != 'null') {
+                        String sourceContent = sh(
+                            script: "${sourceDiff}",
+                            returnStdout: true
+                        ).trim()
+
+                        echo "${sourceContent}"
+
+                        if ("${sourceContent}") {
+                            sh "cd translation && cd en_us && mv user-registration-base.json user-registration-base_`date +%d_%m_%Y`.json"
+                            sh "cd translation && cd en_us && ls"
+
+                            sh "mv translation/en_us/user-registration-base_`date +%d_%m_%Y`.json src"
+                            sh "echo 'updated source file is moved to src folder...'"
+                        } 
+                    }else {
+                            sh "echo 'both source files are same. continuing build...'"
+                    }
+                
+                }
+            }
+        }
+
+        stage('Lint'){
+            steps{
+                sh 'sudo npm install jsonlint -g'
+                sh 'jsonlint src/user-registration-base_en_US.json'
+            }
+        }
+
+        stage('Unit Test'){
+            steps{
+                sh  'echo "Unit test..."'
+            }
+        }
+
+        stage('Git Tag'){
+            steps{
+                sh  'echo "Git tag..."'
+            }
+        }
+        stage('Deploy to DEV(BB)'){
+            steps{
+                sh 'echo "Deploy to dev..."'
+                sshagent(credentials: ['digital-transformation-ssh']) {
+                    script{
+                        scmVars = checkout scm
+                        sh "git config --global user.email 'Jenkins@motorolasolutions.com'"
+                        sh "git config --global user.name 'Jenkins'"
+                        sh "git checkout ${scmVars.GIT_LOCAL_BRANCH}"
+                        //sh "git stash"
+                        sh "git pull origin ${scmVars.GIT_LOCAL_BRANCH}"
+                        //sh "git stash pop || echo 'nothing to stash...'"
+                        sh "git status"
+                        sh "git add src/*"
+                        sh "git status"
+                        sh "git commit -m 'moved Updated source file' || echo 'No updated source files. continuing build...'"
+                        sh "git push origin ${scmVars.GIT_LOCAL_BRANCH}"
+                        sh "git status"
+                    }
+                }
+            }
+        }
+    }
+}
+def notifyStash(String state) {
+
+    if ('SUCCESS' == state || 'FAILED' == state) {
+        currentBuild.result = state
+    }
+
+    step([$class : 'StashNotifier',
+        credentialsId : 'ecommerce-service-account',
+        disableInprogressNotification: false,
+        considerUnstableAsSuccess : true,
+        ignoreUnverifiedSSLPeer : true,
+        includeBuildNumberInKey : false,
+        prependParentProjectKey : false,
+        stashServerBaseUrl : 'https://bitbucket.mot-solutions.com'])
+
+}
